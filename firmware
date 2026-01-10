@@ -1,1 +1,171 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <addons/TokenHelper.h> 
+#include <Adafruit_Fingerprint.h>
+#include <ESP32Servo.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
+// --- Cấu hình OLED ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// --- Thông tin kết nối (Giữ nguyên của bạn) ---
+#define WIFI_SSID "Duc"
+#define WIFI_PASSWORD "07032005"
+#define API_KEY "AIzaSyCfBMGBes4Aw5LAsk9PxN840mlH61Jy_V0"
+#define DATABASE_URL "https://vantayduc-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define USER_EMAIL "dieukhien1@gmail.com"
+#define USER_PASSWORD "Thang1111"
+
+#define FINGER_RX 16 
+#define FINGER_TX 17 
+#define SERVO_PIN 13 
+#define LED_PIN   12 
+
+HardwareSerial mySerial(2);
+Adafruit_Fingerprint finger(&mySerial);
+Servo myServo; 
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600);
+
+void logAttendance(int id);
+void displayMsg(String line1, String line2 = "", int textSize = 1);
+uint8_t getFingerprintEnroll(int id);
+
+void setup() {
+  Serial.begin(115200);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) Serial.println(F("OLED failed"));
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  ESP32PWM::allocateTimer(0);
+  myServo.attach(SERVO_PIN, 500, 2400);
+  myServo.write(90);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+
+  timeClient.begin();
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  finger.begin(57600);
+  displayMsg("HE THONG", "READY", 2);
+}
+
+void loop() {
+  if (Firebase.ready()) {
+    timeClient.update();
+    
+    // --- 1. KIỂM TRA LỆNH ĐĂNG KÝ (ENROLL) TỪ APP ---
+    // App sẽ ghi "enroll" vào /finger/command khi bạn nhấn nút Đăng ký trên điện thoại
+    if (Firebase.RTDB.getString(&fbdo, "/finger/command")) {
+      String command = fbdo.stringData();
+      if (command == "enroll") {
+        int id = 0;
+        if (Firebase.RTDB.getInt(&fbdo, "/finger/target_id")) {
+          id = fbdo.intData();
+          if (getFingerprintEnroll(id) == FINGERPRINT_OK) {
+            // Đăng ký xong thì xóa lệnh để quay lại chế độ quét
+            Firebase.RTDB.setString(&fbdo, "/finger/command", "idle"); 
+            displayMsg("HE THONG", "READY", 2);
+          }
+        }
+      }
+    }
+
+    // --- 2. CHẾ ĐỘ LUÔN LUÔN QUÉT (AUTO-SCAN) ---
+    // Không cần đợi lệnh "scan" từ App nữa
+    uint8_t p = finger.getImage();
+    if (p == FINGERPRINT_OK) {
+      p = finger.image2Tz();
+      p = finger.fingerFastSearch();
+
+      if (p == FINGERPRINT_OK) { // THÀNH CÔNG
+        displayMsg("OK!", "ID: " + String(finger.fingerID), 2);
+        
+        // Gửi thông tin lên App để mở cửa trên giao diện
+        Firebase.RTDB.setInt(&fbdo, "/finger/id", finger.fingerID);
+        Firebase.RTDB.setString(&fbdo, "/finger/status", "success");
+        
+        logAttendance(finger.fingerID); // Lưu vào attendance
+        
+        myServo.write(0); delay(3000); myServo.write(90); // Mở cửa
+        
+        Firebase.RTDB.setString(&fbdo, "/finger/status", "idle");
+        displayMsg("HE THONG", "READY", 2);
+      } 
+      else { // THẤT BẠI
+        displayMsg("LOI", "SAI VAN TAY", 2);
+        Firebase.RTDB.setString(&fbdo, "/finger/status", "fail");
+        digitalWrite(LED_PIN, HIGH); delay(2000); digitalWrite(LED_PIN, LOW);
+        Firebase.RTDB.setString(&fbdo, "/finger/status", "idle");
+        displayMsg("HE THONG", "READY", 2);
+      }
+    }
+  }
+}
+
+// Hàm lấy mẫu vân tay 2 lần (enroll)
+uint8_t getFingerprintEnroll(int id) {
+  int p = -1;
+  displayMsg("ENROLL ID: " + String(id), "DAT TAY L1", 1);
+  while (p != FINGERPRINT_OK) { p = finger.getImage(); if (p == FINGERPRINT_NOFINGER) delay(100); }
+  p = finger.image2Tz(1);
+  if (p != FINGERPRINT_OK) return p;
+
+  displayMsg("NHAC TAY RA", "CHO 2 GIAY", 1);
+  delay(2000); p = 0;
+  while (p != FINGERPRINT_NOFINGER) { p = finger.getImage(); }
+
+  displayMsg("ENROLL ID: " + String(id), "DAT TAY L2", 1);
+  p = -1;
+  while (p != FINGERPRINT_OK) { p = finger.getImage(); if (p == FINGERPRINT_NOFINGER) delay(100); }
+  p = finger.image2Tz(2);
+  if (p != FINGERPRINT_OK) return p;
+
+  p = finger.createModel();
+  if (p == FINGERPRINT_OK) {
+    p = finger.storeModel(id);
+    displayMsg("THANH CONG", "DA LUU ID " + String(id), 1);
+    delay(2000);
+    return FINGERPRINT_OK;
+  }
+  return p;
+}
+
+void logAttendance(int id) {
+  unsigned long epochTime = timeClient.getEpochTime();
+  struct tm *ptm = gmtime((time_t *)&epochTime);
+  char dateStr[11];
+  sprintf(dateStr, "%02d-%02d-%d", ptm->tm_mday, ptm->tm_mon + 1, ptm->tm_year + 1900);
+  
+  FirebaseJson json;
+  json.add("id", id);
+  json.add("time", timeClient.getFormattedTime());
+  // App sẽ tự động đọc time này và so sánh Đúng/Trễ
+  
+  Firebase.RTDB.setJSON(&fbdo, "/attendance/" + String(dateStr) + "/" + String(id), &json);
+}
+
+void displayMsg(String line1, String line2, int textSize) {
+  display.clearDisplay();
+  display.setCursor(0, 5); display.setTextSize(1); display.println(line1);
+  display.setCursor(0, 30); display.setTextSize(textSize); display.println(line2);
+  display.display();
+}
