@@ -1,1 +1,3182 @@
+main dart 
+import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:intl/date_symbol_data_local.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'dart:async';
 
+import 'firebase_options.dart'; 
+import 'login_screen.dart';
+import 'dashboard_screen.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  await initializeDateFormatting('vi', null);
+
+  // Bắt đầu lắng nghe vân tay toàn cục
+  startGlobalFingerprintListener();
+
+  runApp(const MyApp());
+}
+
+void startGlobalFingerprintListener() {
+  FirebaseAuth.instance.authStateChanges().listen((User? user) {
+    if (user != null) {
+      DatabaseReference deviceRef = FirebaseDatabase.instance.ref('users/${user.uid}/device_control');
+      
+      deviceRef.child('last_scan_id').onValue.listen((event) async {
+        final id = event.snapshot.value;
+        if (id != null && id != 0) {
+          int sid = int.parse(id.toString());
+          String foundName = "not imformation";
+
+          // Tìm tên xuyên suốt tất cả các lớp
+          final classesSnap = await FirebaseDatabase.instance.ref('users/${user.uid}/classes').get();
+          if (classesSnap.exists) {
+            Map classes = classesSnap.value as Map;
+            for (var classKey in classes.keys) {
+              Map? students = classes[classKey]['students'];
+              if (students != null) {
+                students.forEach((sKey, sVal) {
+                  if (sVal['fingerprint_id'] == sid) foundName = sVal['name'];
+                });
+              }
+              if (foundName != "not imformation") break;
+            }
+          }
+          // Trả tên về cho ESP32 hiển thị LCD
+          await deviceRef.update({'last_scan_name': foundName});
+        }
+      });
+    }
+  });
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'IoT Smart Classroom',
+      theme: ThemeData(
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF3399CC),
+          primary: const Color(0xFF3399CC),
+          secondary: const Color(0xFF000066),
+        ),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Color(0xFF000066),
+          foregroundColor: Colors.white,
+          centerTitle: true,
+        ),
+      ),
+      localizationsDelegates: const [
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+      ],
+      supportedLocales: const [Locale('vi', ''), Locale('en', '')],
+      locale: const Locale('vi', ''), 
+      home: StreamBuilder<User?>(
+        stream: FirebaseAuth.instance.authStateChanges(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Scaffold(body: Center(child: CircularProgressIndicator()));
+          }
+          if (snapshot.hasData) return const DashboardScreen();
+          return const LoginScreen();
+        },
+      ),
+    );
+  }
+}
+login screen dart 
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'register_screen.dart';
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final _usernameController = TextEditingController();
+  final _passController = TextEditingController();
+  bool isLoading = false;
+  bool rememberMe = false;
+
+  static const Color primaryColor = Color(0xFF3399CC);
+  static const Color darkColor = Color(0xFF000066);
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSavedCredentials();
+  }
+
+  Future<void> _loadSavedCredentials() async {
+    final prefs = await SharedPreferences.getInstance();
+    final savedUsername = prefs.getString('username');
+    final savedPass = prefs.getString('password');
+    final savedRemember = prefs.getBool('rememberMe') ?? false;
+
+    if (savedRemember && savedUsername != null && savedPass != null) {
+      setState(() {
+        _usernameController.text = savedUsername;
+        _passController.text = savedPass;
+        rememberMe = true;
+      });
+    }
+  }
+
+  Future<void> _saveCredentials() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (rememberMe) {
+      await prefs.setString('username', _usernameController.text.trim());
+      await prefs.setString('password', _passController.text.trim());
+      await prefs.setBool('rememberMe', true);
+    } else {
+      await prefs.remove('username');
+      await prefs.remove('password');
+      await prefs.setBool('rememberMe', false);
+    }
+  }
+
+  // HÀM ĐÃ SỬA HOÀN HẢO - BÂY GIỜ LUÔN TÌM ĐƯỢC EMAIL
+  Future<String?> _getEmailFromUsername(String username) async {
+    try {
+      final trimmedUsername = username.trim().toLowerCase();
+      final ref = FirebaseDatabase.instance.ref('users');
+      final snapshot = await ref.orderByChild('username').equalTo(trimmedUsername).get();
+
+      if (snapshot.exists && snapshot.value != null) {
+        final data = snapshot.value as Map<dynamic, dynamic>;
+        // Lấy phần tử đầu tiên
+        final userData = data.values.first as Map<dynamic, dynamic>;
+        final email = userData['email'] as String?;
+        print('✅ Tìm thấy email: $email cho username: $trimmedUsername');
+        return email;
+      } else {
+        print('❌ Không tìm thấy username: $trimmedUsername');
+        return null;
+      }
+    } catch (e) {
+      print('Lỗi khi tìm username: $e');
+      return null;
+    }
+  }
+
+  Future<void> handleLogin() async {
+    setState(() => isLoading = true);
+    try {
+      final username = _usernameController.text.trim();
+      final password = _passController.text.trim();
+
+      if (username.isEmpty || password.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text("Vui lòng nhập tên đăng nhập và mật khẩu"),
+              backgroundColor: Colors.orange,
+            ),
+          );
+        }
+        setState(() => isLoading = false);
+        return;
+      }
+
+      final email = await _getEmailFromUsername(username);
+      if (email == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text("Tên đăng nhập không tồn tại. Vui lòng kiểm tra hoặc đăng ký mới!"),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+        setState(() => isLoading = false);
+        return;
+      }
+
+      await FirebaseAuth.instance.signInWithEmailAndPassword(
+        email: email,
+        password: password,
+      );
+
+      await _saveCredentials();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Đăng nhập thành công!"),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+    } on FirebaseAuthException catch (e) {
+      String msg = "Lỗi đăng nhập";
+      if (e.code == 'user-not-found' || e.code == 'wrong-password') {
+        msg = "Sai mật khẩu hoặc tài khoản không tồn tại";
+      } else if (e.code == 'too-many-requests') {
+        msg = "Quá nhiều lần thử. Vui lòng thử lại sau";
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(msg), backgroundColor: Colors.red),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Lỗi kết nối. Vui lòng thử lại")),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => isLoading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(
+          image: DecorationImage(
+            image: AssetImage('assets/images/background.jpg'),
+            fit: BoxFit.cover,
+            colorFilter: ColorFilter.mode(Colors.black45, BlendMode.darken),
+          ),
+        ),
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Image.asset(
+                  'assets/images/logo.png',
+                  width: 180,
+                  height: 180,
+                  fit: BoxFit.contain,
+                ),
+                const SizedBox(height: 20),
+                const Text(
+                  "IoT Classroom",
+                  style: TextStyle(
+                    fontSize: 32,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                    shadows: [Shadow(blurRadius: 10, color: Colors.black45, offset: Offset(0, 3))],
+                  ),
+                ),
+                const SizedBox(height: 50),
+
+                Container(
+                  padding: const EdgeInsets.all(28),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.95),
+                    borderRadius: BorderRadius.circular(28),
+                    boxShadow: [
+                      BoxShadow(color: Colors.black.withValues(alpha: 0.3), blurRadius: 20, offset: const Offset(0, 10)),
+                    ],
+                  ),
+                  child: Column(
+                    children: [
+                      TextField(
+                        controller: _usernameController,
+                        decoration: InputDecoration(
+                          prefixIcon: const Icon(Icons.person, color: primaryColor),
+                          hintText: "Tên đăng nhập",
+                          filled: true,
+                          fillColor: Colors.grey[50],
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide(color: primaryColor.withValues(alpha: 0.3)),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide(color: primaryColor, width: 2),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+
+                      TextField(
+                        controller: _passController,
+                        obscureText: true,
+                        decoration: InputDecoration(
+                          prefixIcon: const Icon(Icons.lock, color: primaryColor),
+                          hintText: "Mật khẩu",
+                          filled: true,
+                          fillColor: Colors.grey[50],
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide(color: primaryColor.withValues(alpha: 0.3)),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide(color: primaryColor, width: 2),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+
+                      Row(
+                        children: [
+                          Checkbox(
+                            value: rememberMe,
+                            activeColor: primaryColor,
+                            onChanged: (value) {
+                              setState(() => rememberMe = value ?? false);
+                            },
+                          ),
+                          const Text("Lưu mật khẩu", style: TextStyle(color: darkColor, fontSize: 14)),
+                        ],
+                      ),
+
+                      const SizedBox(height: 20),
+
+                      isLoading
+                          ? const CircularProgressIndicator(color: primaryColor)
+                          : SizedBox(
+                              width: double.infinity,
+                              height: 54,
+                              child: ElevatedButton(
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: primaryColor,
+                                  foregroundColor: Colors.white,
+                                  elevation: 6,
+                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                ),
+                                onPressed: handleLogin,
+                                child: const Text(
+                                  "ĐĂNG NHẬP",
+                                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                                ),
+                              ),
+                            ),
+
+                      const SizedBox(height: 16),
+
+                      TextButton(
+                        onPressed: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(builder: (_) => const RegisterScreen()),
+                          );
+                        },
+                        child: Text(
+                          "Chưa có tài khoản? Đăng ký ngay",
+                          style: TextStyle(color: darkColor, fontWeight: FontWeight.w600, fontSize: 15),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+history screen dart
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:firebase_database/ui/firebase_animated_list.dart';
+import 'package:flutter/material.dart';
+import 'package:fl_chart/fl_chart.dart';
+import 'package:intl/intl.dart';
+
+class HistoryScreen extends StatefulWidget {
+  final String classId;
+  final DatabaseReference classRef;
+  const HistoryScreen({super.key, required this.classId, required this.classRef});
+
+  @override
+  State<HistoryScreen> createState() => _HistoryScreenState();
+}
+
+class _HistoryScreenState extends State<HistoryScreen> {
+  final user = FirebaseAuth.instance.currentUser!;
+  late DatabaseReference _historyRef;
+  DateTime _selectedDate = DateTime.now();
+  int _total = 0, _present = 0, _late = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    // Đường dẫn lịch sử theo từng lớp
+    _historyRef = FirebaseDatabase.instance.ref('users/${user.uid}/classes/${widget.classId}/history');
+    _loadStats();
+  }
+
+  Future<void> _loadStats() async {
+    final stdSnap = await widget.classRef.get();
+    final histSnap = await _historyRef.get();
+    
+    // Tính tổng số học sinh trong lớp này
+    int total = stdSnap.exists ? (stdSnap.value as Map).length : 0;
+    
+    Map<String, String> attendanceMap = {}; 
+    String dateStr = DateFormat('yyyy-MM-dd').format(_selectedDate);
+
+    if (histSnap.exists) {
+      (histSnap.value as Map).forEach((k, v) {
+        // Chỉ lọc những lượt quét trong ngày đã chọn
+        if (v['time'].toString().contains(dateStr)) {
+          attendanceMap[v['name']] = v['status'] ?? "Co mat";
+        }
+      });
+    }
+
+    int p = 0, l = 0;
+    attendanceMap.forEach((name, status) {
+      if (status == "Di tre") l++; else p++;
+    });
+
+    if (mounted) {
+      setState(() {
+        _total = total;
+        _present = p;
+        _late = l;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Số học sinh vắng = Tổng - (Đúng giờ + Trễ)
+    int absent = (_total - (_present + _late)).clamp(0, 999);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("Lịch sử điểm danh"),
+      ),
+      body: Column(
+        children: [
+          // BỐ CỤC LỌC NGÀY THÁNG
+          ListTile(
+            tileColor: Colors.blue[50],
+            title: Text(
+              "Ngày: ${DateFormat('dd/MM/yyyy').format(_selectedDate)}",
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            trailing: const Icon(Icons.calendar_today, color: Color(0xFF000066)),
+            onTap: () async {
+              final d = await showDatePicker(
+                context: context,
+                initialDate: _selectedDate,
+                firstDate: DateTime(2024),
+                lastDate: DateTime(2030),
+              );
+              if (d != null) {
+                setState(() => _selectedDate = d);
+                _loadStats();
+              }
+            },
+          ),
+          
+          const SizedBox(height: 20),
+          
+          // BIỂU ĐỒ TRÒN 3 MÀU (Xanh: Đúng, Cam: Trễ, Đỏ: Vắng)
+          SizedBox(
+            height: 180,
+            child: PieChart(
+              PieChartData(
+                sections: [
+                  PieChartSectionData(value: _present.toDouble(), title: 'Đúng', color: Colors.green, radius: 50, titleStyle: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
+                  PieChartSectionData(value: _late.toDouble(), title: 'Trễ', color: Colors.orange, radius: 50, titleStyle: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
+                  PieChartSectionData(value: absent.toDouble(), title: 'Vắng', color: Colors.red, radius: 50, titleStyle: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
+                ],
+                centerSpaceRadius: 40,
+              ),
+            ),
+          ),
+          
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+            child: Divider(),
+          ),
+
+          // DANH SÁCH CHI TIẾT
+          Expanded(
+            child: FirebaseAnimatedList(
+              query: _historyRef,
+              itemBuilder: (context, snapshot, animation, index) {
+                Map h = snapshot.value as Map;
+                String time = h['time'] ?? "";
+                
+                // Chỉ hiện những người quét đúng ngày đã chọn
+                if (!time.contains(DateFormat('yyyy-MM-dd').format(_selectedDate))) {
+                  return const SizedBox();
+                }
+
+                bool isLate = h['status'] == "Di tre";
+
+                return Card(
+                  margin: const EdgeInsets.symmetric(horizontal: 15, vertical: 5),
+                  elevation: 2,
+                  child: ListTile(
+                    leading: Icon(
+                      isLate ? Icons.warning_amber_rounded : Icons.check_circle_outline,
+                      color: isLate ? Colors.orange : Colors.green,
+                      size: 30,
+                    ),
+                    title: Text(
+                      h['name'] ?? "Không tên",
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    subtitle: Text(time),
+                    trailing: Text(
+                      isLate ? "ĐI TRỄ" : "ĐÚNG GIỜ",
+                      style: TextStyle(
+                        color: isLate ? Colors.orange : Colors.green,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+dasboard screen dart 
+import 'dart:async';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+import 'weather_service.dart';
+import 'power_chart_screen.dart';
+import 'class_detail_screen.dart';
+
+
+class DashboardScreen extends StatefulWidget {
+  const DashboardScreen({super.key});
+
+  @override
+  State<DashboardScreen> createState() => _DashboardScreenState();
+}
+
+class _DashboardScreenState extends State<DashboardScreen> {
+  final user = FirebaseAuth.instance.currentUser!;
+  late DatabaseReference _dbRef;
+
+  String _timeString = "";
+  String _dateString = "";
+  Timer? _timer;
+
+  Map<String, dynamic>? weatherData;
+
+  static const Color primaryColor = Color(0xFF3399CC);
+  static const Color darkColor = Color(0xFF000066);
+
+  int _selectedIndex = 0; // Để highlight icon ở thanh dưới
+
+  @override
+  void initState() {
+    super.initState();
+    _dbRef = FirebaseDatabase.instance.ref('users/${user.uid}');
+
+    _updateTime();
+    _timer = Timer.periodic(const Duration(seconds: 1), (Timer t) => _updateTime());
+
+    loadWeather();
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  void _updateTime() {
+    if (mounted) {
+      final now = DateTime.now();
+      setState(() {
+        _timeString = DateFormat('HH:mm:ss').format(now);
+        _dateString = DateFormat('EEEE, dd/MM/yyyy', 'vi').format(now);
+      });
+    }
+  }
+
+  void loadWeather() async {
+    final data = await WeatherService().fetchWeather("Ho Chi Minh");
+    if (mounted && data.isNotEmpty) {
+      setState(() => weatherData = data);
+    }
+  }
+
+  void toggleDevice(String key, bool currentValue) {
+    _dbRef.child("devices/$key").set(!currentValue);
+  }
+
+  void toggleAutoMode(bool isAuto) {
+    _dbRef.child("devices/mode").set(isAuto ? "auto" : "manual");
+  }
+
+  void _deleteClass(String classId, String className) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Text("Xác nhận xóa", style: TextStyle(color: darkColor, fontWeight: FontWeight.bold)),
+        content: Text("Bạn có chắc chắn muốn xóa lớp '$className'?\nDữ liệu sinh viên sẽ bị xóa vĩnh viễn."),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Hủy", style: TextStyle(color: Colors.grey))),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
+            onPressed: () {
+              _dbRef.child("classes/$classId").remove().then((_) {
+                if (mounted) Navigator.pop(ctx);
+              });
+            },
+            child: const Text("Xóa"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _onBottomItemTapped(int index) {
+    setState(() => _selectedIndex = index);
+    switch (index) {
+      case 0:
+// Cuộn đến phần công suất (hoặc mở PowerChartScreen)
+        Navigator.push(context, MaterialPageRoute(builder: (_) => const PowerChartScreen()));
+        break;
+      case 1:
+        // Tạo lớp
+        _showAddClassDialog(context);
+        break;
+      case 2:
+        // Cấu hình Auto
+        _dbRef.child("settings").once().then((snapshot) {
+          final settings = snapshot.snapshot.value != null ? Map<dynamic, dynamic>.from(snapshot.snapshot.value as Map) : {};
+          _showAutoSettingsDialog(context, settings);
+        });
+        break;
+      case 3:
+        // Danh sách lớp (cuộn xuống hoặc mở list)
+        // Để đơn giản, cuộn xuống phần lớp học
+        // Nếu muốn mở full screen list, có thể tạo screen mới
+        break;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      extendBodyBehindAppBar: true,
+      extendBody: true, // Để bottom bar trong suốt với nền
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              "IoT Smart Lab",
+              style: TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w900,
+                fontSize: 22,
+                shadows: [Shadow(blurRadius: 10, color: Colors.black54)],
+              ),
+            ),
+            Text(
+              "Admin: ${user.email?.split('@')[0]}",
+              style: TextStyle(color: Colors.white70, fontSize: 13),
+            ),
+          ],
+        ),
+        actions: [
+          Container(
+            margin: const EdgeInsets.only(right: 15),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.2),
+              shape: BoxShape.circle,
+              boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 10)],
+            ),
+            child: IconButton(
+              icon: const Icon(Icons.logout_rounded, color: Colors.white),
+              onPressed: () => FirebaseAuth.instance.signOut(),
+            ),
+          )
+        ],
+      ),
+      body: Stack(
+        children: [
+          Container(
+            decoration: const BoxDecoration(
+              image: DecorationImage(
+                image: AssetImage('assets/images/background.jpg'),
+                fit: BoxFit.cover,
+                colorFilter: ColorFilter.mode(Colors.black54, BlendMode.darken),
+              ),
+            ),
+          ),
+
+          SafeArea(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildRealtimeWeatherCard(),
+                  const SizedBox(height: 25),
+                  _sectionTitle("Môi trường & Điện năng"),
+                  _buildSensorStream(),
+                  const SizedBox(height: 25),
+_sectionTitle("Trung tâm Điều khiển"),
+                  _buildControlPanel(),
+                  const SizedBox(height: 25),
+                  _sectionTitle("Lớp học"),
+                  _buildClassList(),
+                  const SizedBox(height: 120), // Chừa chỗ cho bottom bar
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+      bottomNavigationBar: Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            colors: [primaryColor.withOpacity(0.8), darkColor.withOpacity(0.8)],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(30)),
+          boxShadow: [
+            BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 20, offset: const Offset(0, -10)),
+          ],
+        ),
+        child: ClipRRect(
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(30)),
+          child: BottomNavigationBar(
+            backgroundColor: Colors.transparent,
+            selectedItemColor: Colors.white,
+            unselectedItemColor: Colors.white70,
+            showSelectedLabels: false,
+            showUnselectedLabels: false,
+            currentIndex: _selectedIndex,
+            onTap: _onBottomItemTapped,
+            type: BottomNavigationBarType.fixed,
+            elevation: 0,
+            items: const [
+              BottomNavigationBarItem(
+                icon: Icon(Icons.speed_rounded, size: 30),
+                label: 'Công suất',
+              ),
+              BottomNavigationBarItem(
+                icon: Icon(Icons.add_circle_outline_rounded, size: 36),
+                label: 'Tạo lớp',
+              ),
+              BottomNavigationBarItem(
+                icon: Icon(Icons.tune_rounded, size: 30),
+                label: 'Cấu hình Auto',
+              ),
+              BottomNavigationBarItem(
+                icon: Icon(Icons.school_rounded, size: 30),
+                label: 'Lớp học',
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _sectionTitle(String title) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 15, left: 5),
+      child: Text(
+        title,
+        style: TextStyle(
+          fontSize: 20,
+          fontWeight: FontWeight.bold,
+          color: Colors.white,
+          shadows: [Shadow(blurRadius: 10, color: Colors.black54)],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRealtimeWeatherCard() {
+    String temp = "0";
+    String description = "Loading...";
+    String city = "Ho Chi Minh";
+    String feelsLike = "0";
+    String humidity = "0";
+    String wind = "0";
+    String pressure = "0";
+    String iconCode = "02d";
+
+    if (weatherData != null) {
+      temp = (double.tryParse(weatherData!['main']['temp'].toString()) ?? 0).toStringAsFixed(0);
+      description = weatherData!['weather'][0]['main'];
+city = weatherData!['name'] ?? "Unknown";
+      feelsLike = (double.tryParse(weatherData!['main']['feels_like'].toString()) ?? 0).toStringAsFixed(0);
+      humidity = weatherData!['main']['humidity'].toString();
+      wind = weatherData!['wind']['speed'].toString();
+      pressure = weatherData!['main']['pressure'].toString();
+      iconCode = weatherData!['weather'][0]['icon'];
+    }
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(25),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(30),
+        border: Border.all(color: Colors.white.withOpacity(0.2)),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 30, offset: const Offset(0, 15)),
+          BoxShadow(color: primaryColor.withOpacity(0.2), blurRadius: 20, offset: const Offset(0, 5)),
+        ],
+        gradient: LinearGradient(
+          colors: [primaryColor.withOpacity(0.3), darkColor.withOpacity(0.4)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+      ),
+      child: Column(
+        children: [
+          Text(
+            _timeString,
+            style: const TextStyle(fontSize: 50, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: 2, shadows: [Shadow(blurRadius: 10, color: Colors.black54)]),
+          ),
+          Text(
+            _dateString,
+            style: const TextStyle(fontSize: 18, color: Colors.white70),
+          ),
+          const Divider(color: Colors.white30, height: 30),
+
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Image.network(
+                    "https://openweathermap.org/img/wn/$iconCode@2x.png",
+                    width: 80,
+                    height: 80,
+                    errorBuilder: (_, __, ___) => const Icon(Icons.wb_cloudy, color: Colors.white, size: 60),
+                  ),
+                  const SizedBox(width: 15),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(description, style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: Colors.white)),
+                      Text(city, style: const TextStyle(fontSize: 16, color: Colors.white70)),
+                    ],
+                  ),
+                ],
+              ),
+              Text("$temp°", style: const TextStyle(fontSize: 60, fontWeight: FontWeight.w300, color: Colors.white)),
+            ],
+          ),
+
+          const SizedBox(height: 25),
+
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              _buildWeatherDetailItem("$feelsLike°", "Cảm giác"),
+_buildWeatherDetailItem("$humidity%", "Độ ẩm"),
+              _buildWeatherDetailItem(wind, "Gió (m/s)"),
+              _buildWeatherDetailItem("${pressure}hpa", "Áp suất"),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWeatherDetailItem(String value, String label) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white.withOpacity(0.2)),
+      ),
+      child: Column(
+        children: [
+          Text(value, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
+          const SizedBox(height: 4),
+          Text(label, style: const TextStyle(fontSize: 12, color: Colors.white70)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSensorStream() {
+    return StreamBuilder(
+      stream: _dbRef.child("sensors").onValue,
+      builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
+        double vol = 0, cur = 0, power = 0, temp = 0, hum = 0;
+        if (snapshot.hasData && snapshot.data!.snapshot.value != null) {
+          final data = Map<String, dynamic>.from(snapshot.data!.snapshot.value as Map);
+          vol = double.tryParse(data['voltage'].toString()) ?? 0;
+          cur = double.tryParse(data['current'].toString()) ?? 0;
+          power = double.tryParse(data['power'].toString()) ?? 0;
+          temp = double.tryParse(data['temp'].toString()) ?? 0;
+          hum = double.tryParse(data['hum'].toString()) ?? 0;
+        }
+
+        return Column(
+          children: [
+            Row(
+              children: [
+                Expanded(child: _buildInfoCard("Điện áp", "$vol", "V", primaryColor, Icons.bolt_rounded)),
+                const SizedBox(width: 15),
+                Expanded(child: _buildInfoCard("Dòng điện", "$cur", "A", primaryColor, Icons.electrical_services_rounded)),
+              ],
+            ),
+            const SizedBox(height: 15),
+            GestureDetector(
+              onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const PowerChartScreen())),
+              child: Container(
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.15),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: Colors.white.withOpacity(0.2)),
+                  boxShadow: [
+                    BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 30, offset: const Offset(0, 15)),
+                  ],
+                  gradient: LinearGradient(
+                    colors: [primaryColor.withOpacity(0.3), darkColor.withOpacity(0.4)],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                ),
+child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(color: Colors.white.withOpacity(0.2), shape: BoxShape.circle),
+                          child: Icon(Icons.speed_rounded, color: Colors.white, size: 28),
+                        ),
+                        const SizedBox(width: 15),
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text("Công suất tiêu thụ", style: TextStyle(color: Colors.white70, fontSize: 13)),
+                            Text("$power W", style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.white)),
+                          ],
+                        ),
+                      ],
+                    ),
+                    const Icon(Icons.arrow_forward_ios_rounded, size: 18, color: Colors.white70),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 15),
+            Row(
+              children: [
+                Expanded(child: _buildInfoCard("Nhiệt độ", "$temp", "°C", primaryColor, Icons.thermostat_rounded)),
+                const SizedBox(width: 15),
+                Expanded(child: _buildInfoCard("Độ ẩm", "$hum", "%", primaryColor, Icons.water_drop_rounded)),
+              ],
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildInfoCard(String title, String value, String unit, Color color, IconData icon) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white.withOpacity(0.2)),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 30, offset: const Offset(0, 15)),
+        ],
+      ),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(color: color.withOpacity(0.2), shape: BoxShape.circle),
+            child: Icon(icon, color: color, size: 24),
+          ),
+          const SizedBox(width: 15),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: const TextStyle(color: Colors.white70, fontSize: 12)),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.baseline,
+                textBaseline: TextBaseline.alphabetic, // Đã fix lỗi assertion
+                children: [
+                  Text(value, style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white)),
+const SizedBox(width: 4),
+                  Text(unit, style: TextStyle(fontSize: 12, color: Colors.white70)),
+                ],
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildControlPanel() {
+    return StreamBuilder(
+      stream: _dbRef.onValue,
+      builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
+        if (!snapshot.hasData || snapshot.data!.snapshot.value == null) {
+          return const Center(child: CircularProgressIndicator(color: Colors.white));
+        }
+
+        final data = Map<String, dynamic>.from(snapshot.data!.snapshot.value as Map);
+        final devices = data['devices'] != null ? Map<String, dynamic>.from(data['devices']) : {};
+        final settings = data['settings'] != null ? Map<String, dynamic>.from(data['settings']) : {};
+
+        bool isAuto = (devices['mode'] == 'auto');
+        bool light = devices['light'] ?? false;
+        bool ac = devices['ac'] ?? false;
+        bool fan = devices['fan'] ?? false;
+
+        return Container(
+          decoration: BoxDecoration(
+            color: Colors.white.withOpacity(0.15),
+            borderRadius: BorderRadius.circular(30),
+            border: Border.all(color: Colors.white.withOpacity(0.2)),
+            boxShadow: [
+              BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 30, offset: const Offset(0, 15)),
+            ],
+            gradient: LinearGradient(
+              colors: [primaryColor.withOpacity(0.3), darkColor.withOpacity(0.4)],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+          ),
+          child: Column(
+            children: [
+              // Header Chế độ - Gradient nổi bật
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [primaryColor.withOpacity(0.5), darkColor.withOpacity(0.5)],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  borderRadius: const BorderRadius.vertical(top: Radius.circular(30)),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(color: Colors.white.withOpacity(0.2), shape: BoxShape.circle),
+                          child: Icon(isAuto ? Icons.smart_toy : Icons.touch_app, color: Colors.white),
+                        ),
+                        const SizedBox(width: 15),
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+Text(
+                              isAuto ? "Chế độ Tự động" : "Chế độ Thủ công",
+                              style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white, fontSize: 16),
+                            ),
+                            if (isAuto)
+                              const Text("Hệ thống tự quản lý", style: TextStyle(fontSize: 12, color: Colors.white70)),
+                          ],
+                        ),
+                      ],
+                    ),
+                    Switch(
+                      value: isAuto,
+                      activeColor: Colors.white,
+                      inactiveThumbColor: Colors.grey,
+                      inactiveTrackColor: Colors.grey.withOpacity(0.5),
+                      onChanged: (val) => toggleAutoMode(val),
+                    ),
+                  ],
+                ),
+              ),
+
+              // Danh sách thiết bị - Card con nổi
+              _buildSwitchItem("Đèn Lớp Học", Icons.lightbulb, primaryColor, light, isAuto, (v) => toggleDevice('light', light)),
+              const Divider(color: Colors.white30, height: 1),
+              _buildSwitchItem("Máy Lạnh", Icons.ac_unit, primaryColor, ac, isAuto, (v) => toggleDevice('ac', ac)),
+              const Divider(color: Colors.white30, height: 1),
+              _buildSwitchItem("Quạt Máy", Icons.wind_power, primaryColor, fan, isAuto, (v) => toggleDevice('fan', fan)),
+
+              // Nút Cấu hình - Gradient + Shadow
+              if (isAuto)
+                InkWell(
+                  onTap: () => _showAutoSettingsDialog(context, settings),
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(vertical: 15),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [primaryColor.withOpacity(0.5), darkColor.withOpacity(0.5)],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      borderRadius: const BorderRadius.vertical(bottom: Radius.circular(30)),
+                      boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.2), blurRadius: 10)],
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.tune_rounded, color: Colors.white, size: 20),
+                        const SizedBox(width: 8),
+                        Text("Cấu hình Ngưỡng & Hẹn giờ", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildSwitchItem(String title, IconData icon, Color color, bool value, bool isAuto, Function(bool) onChanged) {
+return ListTile(
+      contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 5),
+      leading: Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: value ? color.withOpacity(0.2) : Colors.grey.withOpacity(0.2),
+          shape: BoxShape.circle,
+          boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.2), blurRadius: 8)],
+        ),
+        child: Icon(icon, color: value ? color : Colors.grey, size: 24),
+      ),
+      title: Text(title, style: TextStyle(fontWeight: FontWeight.w600, color: value ? Colors.white : Colors.white70)),
+      subtitle: isAuto ? const Text("Đã khóa (Auto Mode)", style: TextStyle(fontSize: 11, color: Colors.white70)) : null,
+      trailing: Switch(
+        value: value,
+        activeColor: color,
+        inactiveThumbColor: Colors.grey,
+        inactiveTrackColor: Colors.grey.withOpacity(0.5),
+        onChanged: isAuto ? null : onChanged,
+      ),
+    );
+  }
+
+  // Các hàm còn lại (dialog settings, class list, add class) giữ nguyên hoặc thêm style glass + shadow tương tự nếu cần
+  // Ví dụ: Trong _showAutoSettingsDialog, thêm 
+  // --- DIALOG SETTINGS ---
+  void _showAutoSettingsDialog(BuildContext context, Map<dynamic, dynamic> currentSettings) {
+    double tempThreshold = double.tryParse(currentSettings['temp_threshold'].toString()) ?? 30.0;
+    double humThreshold = double.tryParse(currentSettings['hum_threshold'].toString()) ?? 70.0;
+    Map timers = currentSettings['timers'] ?? {};
+
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setStateDialog) {
+            return AlertDialog(
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+              title: Text("Cài đặt Tự động", style: TextStyle(fontWeight: FontWeight.bold, color: darkColor)),
+              scrollable: true,
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text("NGƯỠNG MÔI TRƯỜNG", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.grey)),
+                  const SizedBox(height: 10),
+                  
+                  _buildSliderRow("Nhiệt độ bật Máy lạnh", tempThreshold, 16, 40, "°C", (val) => setStateDialog(() => tempThreshold = val)),
+                  _buildSliderRow("Độ ẩm bật Quạt", humThreshold, 40, 95, "%", (val) => setStateDialog(() => humThreshold = val)),
+
+                  const SizedBox(height: 20),
+                  const Text("LỊCH HOẠT ĐỘNG (TIMER)", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.grey)),
+                  const SizedBox(height: 10),
+                  
+                  _buildTimerRow("Đèn", "light", timers, setStateDialog),
+                  _buildTimerRow("Máy lạnh", "ac", timers, setStateDialog),
+_buildTimerRow("Quạt", "fan", timers, setStateDialog),
+                ],
+              ),
+              actions: [
+                TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Hủy", style: TextStyle(color: Colors.grey))),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(backgroundColor: primaryColor, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+                  onPressed: () {
+                    _dbRef.child("settings").update({
+                      "temp_threshold": tempThreshold,
+                      "hum_threshold": humThreshold,
+                      "timers": timers,
+                    });
+                    Navigator.pop(ctx);
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Đã lưu cài đặt!")));
+                  },
+                  child: const Text("Lưu Cài Đặt", style: TextStyle(color: Colors.white)),
+                )
+              ],
+            );
+          },
+        );
+      }
+    );
+  }
+
+  Widget _buildSliderRow(String label, double value, double min, double max, String unit, Function(double) onChanged) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(label, style: const TextStyle(fontWeight: FontWeight.w500)),
+            Text("${value.toStringAsFixed(0)}$unit", style: TextStyle(fontWeight: FontWeight.bold, color: primaryColor)),
+          ],
+        ),
+        SliderTheme(
+          data: SliderTheme.of(context).copyWith(trackHeight: 2),
+          child: Slider(
+            value: value, min: min, max: max, divisions: (max-min).toInt(),
+            activeColor: primaryColor,
+            inactiveColor: primaryColor.withOpacity(0.1),
+            onChanged: onChanged,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildTimerRow(String label, String key, Map timers, StateSetter setStateDialog) {
+    Map deviceTimer = timers[key] != null ? Map.from(timers[key]) : {};
+    String start = deviceTimer['start'] ?? "--:--";
+    String end = deviceTimer['end'] ?? "--:--";
+    bool isActive = deviceTimer['active'] ?? false;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: isActive ? primaryColor.withOpacity(0.05) : Colors.grey.withOpacity(0.05),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: isActive ? primaryColor.withOpacity(0.2) : Colors.transparent),
+      ),
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(label, style: TextStyle(fontWeight: FontWeight.bold, color: isActive ? darkColor : Colors.grey)),
+              Switch(
+                value: isActive, 
+activeColor: primaryColor,
+                onChanged: (val) {
+                  setStateDialog(() {
+                    if(timers[key] == null) timers[key] = {};
+                    timers[key]['active'] = val;
+                  });
+                }
+              )
+            ],
+          ),
+          if (isActive)
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                _buildTimePickerBtn(start, Icons.wb_sunny_outlined, () async {
+                  TimeOfDay? t = await showTimePicker(context: context, initialTime: const TimeOfDay(hour: 7, minute: 0));
+                  if(t != null) {
+                    setStateDialog(() {
+                       if(timers[key] == null) timers[key] = {};
+                       timers[key]['start'] = "${t.hour.toString().padLeft(2,'0')}:${t.minute.toString().padLeft(2,'0')}";
+                    });
+                  }
+                }),
+                const Icon(Icons.arrow_right_alt, color: Colors.grey),
+                _buildTimePickerBtn(end, Icons.nightlight_outlined, () async {
+                  TimeOfDay? t = await showTimePicker(context: context, initialTime: const TimeOfDay(hour: 17, minute: 0));
+                  if(t != null) {
+                    setStateDialog(() {
+                       if(timers[key] == null) timers[key] = {};
+                       timers[key]['end'] = "${t.hour.toString().padLeft(2,'0')}:${t.minute.toString().padLeft(2,'0')}";
+                    });
+                  }
+                }),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTimePickerBtn(String time, IconData icon, VoidCallback onTap) {
+    return InkWell(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(5), border: Border.all(color: Colors.grey.withOpacity(0.2))),
+        child: Row(
+          children: [
+            Icon(icon, size: 14, color: Colors.grey),
+            const SizedBox(width: 5),
+            Text(time, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // --- WIDGET LỚP HỌC ---
+  Widget _buildClassList() {
+    return StreamBuilder(
+      stream: _dbRef.child("classes").onValue,
+      builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
+        if (!snapshot.hasData || snapshot.data!.snapshot.value == null) {
+          return Center(child: Container(padding: const EdgeInsets.all(20), child: const Text("Chưa có lớp học nào.", style: TextStyle(color: Colors.grey))));
+        }
+        Map<dynamic, dynamic> classesMap = snapshot.data!.snapshot.value as Map;
+        List<dynamic> classes = [];
+        classesMap.forEach((key, value) {
+          final data = Map<String, dynamic>.from(value);
+          data['key'] = key;
+          classes.add(data);
+        });
+return ListView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          itemCount: classes.length,
+          itemBuilder: (ctx, index) {
+            final cls = classes[index];
+            return Container(
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(15), boxShadow: [BoxShadow(color: Colors.grey.withOpacity(0.05), blurRadius: 5, offset: const Offset(0, 3))]),
+              child: ListTile(
+                contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                leading: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(color: primaryColor.withOpacity(0.1), borderRadius: BorderRadius.circular(12)),
+                  child: Icon(Icons.school, color: primaryColor),
+                ),
+                title: Text(cls['name'] ?? "Lớp", style: TextStyle(fontWeight: FontWeight.bold, color: darkColor)),
+                subtitle: Text("${cls['subject'] ?? ''}", style: const TextStyle(fontSize: 12)),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 20),
+                      onPressed: () => _deleteClass(cls['key'], cls['name'] ?? "Lớp"),
+                    ),
+                    const Icon(Icons.arrow_forward_ios_rounded, size: 16, color: Colors.grey),
+                  ],
+                ),
+                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ClassDetailScreen(classId: cls['key'], className: cls['name']))),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _showAddClassDialog(BuildContext context) {
+    final nameController = TextEditingController();
+    final subjectController = TextEditingController();
+    showDialog(context: context, builder: (ctx) => AlertDialog(
+        title: Text("Tạo Lớp Học Mới", style: TextStyle(color: darkColor, fontWeight: FontWeight.bold)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(controller: nameController, decoration: InputDecoration(labelText: "Tên Lớp (VD: 12A1)", border: const OutlineInputBorder(), prefixIcon: const Icon(Icons.class_), focusedBorder: OutlineInputBorder(borderSide: BorderSide(color: primaryColor)))),
+            const SizedBox(height: 15),
+            TextField(controller: subjectController, decoration: InputDecoration(labelText: "Môn Học", border: const OutlineInputBorder(), prefixIcon: const Icon(Icons.book), focusedBorder: OutlineInputBorder(borderSide: BorderSide(color: primaryColor)))),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Hủy")),
+ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: primaryColor, foregroundColor: Colors.white),
+            onPressed: () {
+              if(nameController.text.isNotEmpty) {
+                _dbRef.child("classes").push().set({'name': nameController.text, 'subject': subjectController.text, 'count': 0});
+                Navigator.pop(ctx);
+              }
+            },
+            child: const Text("Tạo Lớp"),
+          ),
+        ],
+      )
+    );
+  }
+}
+class detail screen dart 
+import 'dart:async';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:firebase_database/ui/firebase_animated_list.dart';
+import 'package:flutter/material.dart';
+import 'history_screen.dart';
+
+class ClassDetailScreen extends StatefulWidget {
+  final String classId;
+  final String className;
+
+  const ClassDetailScreen({super.key, required this.classId, required this.className});
+
+  @override
+  State<ClassDetailScreen> createState() => _ClassDetailScreenState();
+}
+
+class _ClassDetailScreenState extends State<ClassDetailScreen> {
+  late DatabaseReference _classRef, _deviceRef, _configRef;
+  final user = FirebaseAuth.instance.currentUser!;
+  StreamSubscription? _scanSub, _enrollSub;
+  int? _highlightId; // ID để làm sáng tên sinh viên trên App
+  String _startTime = "08:00";
+
+  final TextEditingController _nameController = TextEditingController();
+  final TextEditingController _mssvController = TextEditingController();
+  final TextEditingController _fingerIdController = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _classRef = FirebaseDatabase.instance.ref('users/${user.uid}/classes/${widget.classId}/students');
+    _deviceRef = FirebaseDatabase.instance.ref('users/${user.uid}/device_control');
+    _configRef = FirebaseDatabase.instance.ref('users/${user.uid}/classes/${widget.classId}/config');
+
+    // 1. Báo hiệu lớp đang hoạt động cho ESP32 biết
+    _deviceRef.update({'active_class_id': widget.classId});
+    _loadConfig();
+
+    // 2. LOGIC LÀM SÁNG TÊN VÀ HIỆN DẤU TÍCH XANH KHI QUÉT VÂN TAY
+    _scanSub = _deviceRef.child('last_scan_id').onValue.listen((event) {
+      final id = event.snapshot.value;
+      if (id != null && id != 0 && mounted) {
+        setState(() {
+          _highlightId = int.parse(id.toString());
+        });
+        // Sau 3 giây thì tắt hiệu ứng sáng
+        Timer(const Duration(seconds: 3), () {
+          if (mounted) setState(() => _highlightId = null);
+        });
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _deviceRef.update({'active_class_id': 'none'});
+    _scanSub?.cancel();
+    _enrollSub?.cancel();
+    _nameController.dispose();
+    _mssvController.dispose();
+    _fingerIdController.dispose();
+    super.dispose();
+  }
+
+  void _loadConfig() async {
+    final snap = await _configRef.child('start_time').get();
+    if (snap.exists && mounted) setState(() => _startTime = snap.value.toString());
+  }
+
+  Future<void> _selectStartTime() async {
+    final TimeOfDay? p = await showTimePicker(context: context, initialTime: const TimeOfDay(hour: 8, minute: 0));
+    if (p != null) {
+      String t = "${p.hour.toString().padLeft(2, '0')}:${p.minute.toString().padLeft(2, '0')}";
+      await _configRef.update({'start_time': t});
+      setState(() => _startTime = t);
+    }
+  }
+
+  void _showAddStudentDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text("Đăng ký vân tay mới"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(controller: _nameController, decoration: const InputDecoration(labelText: "Họ tên")),
+            TextField(controller: _mssvController, decoration: const InputDecoration(labelText: "MSSV")),
+            TextField(controller: _fingerIdController, decoration: const InputDecoration(labelText: "ID (1-127)"), keyboardType: TextInputType.number),
+            const SizedBox(height: 10),
+            StreamBuilder(
+              stream: _deviceRef.child('status').onValue,
+              builder: (context, snap) => Text("Cảm biến: ${snap.data?.snapshot.value ?? "..."}", 
+                  style: const TextStyle(color: Colors.blue, fontWeight: FontWeight.bold)),
+            )
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Hủy")),
+          ElevatedButton(
+            onPressed: () async {
+              if (_fingerIdController.text.isEmpty) return;
+              int fid = int.parse(_fingerIdController.text);
+              
+              // Gửi lệnh cho ESP32 bắt đầu quét
+              await _deviceRef.update({'mode': 'enroll', 'enroll_id': fid, 'status': 'Hãy đặt tay...'});
+              
+              _enrollSub = _deviceRef.child('status').onValue.listen((event) async {
+                if (event.snapshot.value == "OK" && mounted) {
+                  
+                  // A. Lưu vào danh sách sinh viên của lớp học (Để App hiển thị)
+                  await _classRef.push().set({
+                    'name': _nameController.text, 
+                    'mssv': _mssvController.text, 
+                    'fingerprint_id': fid
+                  });
+
+                  // B. LƯU VÀO DANH BẠ CHUNG (Để ESP32 đọc được tên ngay lập tức)
+                  // Đây là phần quan trọng để khắc phục lỗi "Not Information"
+                  await FirebaseDatabase.instance.ref('users/${user.uid}/fingerprints/$fid').set({
+                    'name': _nameController.text,
+                    'mssv': _mssvController.text,
+                  });
+
+                  _enrollSub?.cancel();
+                  _nameController.clear();
+                  _mssvController.clear();
+                  _fingerIdController.clear();
+                  Navigator.pop(context);
+                }
+              });
+            }, 
+            child: const Text("Bắt đầu quét")
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.className),
+        actions: [
+          IconButton(icon: const Icon(Icons.alarm_on), onPressed: _selectStartTime),
+          IconButton(icon: const Icon(Icons.history), onPressed: () => Navigator.push(context, MaterialPageRoute(
+              builder: (context) => HistoryScreen(classId: widget.classId, classRef: _classRef)))),
+        ],
+      ),
+      body: Column(
+        children: [
+          Container(
+            width: double.infinity, padding: const EdgeInsets.all(12), color: Colors.blue[50],
+            child: Text("Giờ vào lớp: $_startTime", textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.bold)),
+          ),
+          Expanded(
+            child: FirebaseAnimatedList(
+              query: _classRef,
+              itemBuilder: (context, snapshot, animation, index) {
+                Map s = snapshot.value as Map;
+                int sid = s['fingerprint_id'] ?? 0;
+                bool isHighlighted = (_highlightId == sid); // Kiểm tra trùng ID đang quét
+
+                return AnimatedContainer(
+                  duration: const Duration(milliseconds: 500),
+                  margin: const EdgeInsets.symmetric(horizontal: 15, vertical: 5),
+                  decoration: BoxDecoration(
+                    color: isHighlighted ? Colors.yellow[100] : Colors.white, // Làm sáng màu vàng
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: isHighlighted ? Colors.orange : Colors.grey[300]!, width: isHighlighted ? 2 : 1),
+                  ),
+                  child: ListTile(
+                    leading: CircleAvatar(
+                      backgroundColor: isHighlighted ? Colors.orange : const Color(0xFF000066), 
+                      child: Text(sid.toString(), style: const TextStyle(color: Colors.white)),
+                    ),
+                    title: Text(s['name'] ?? "", style: TextStyle(fontWeight: isHighlighted ? FontWeight.bold : FontWeight.normal)),
+                    subtitle: Text("MSSV: ${s['mssv']}"),
+                    trailing: isHighlighted 
+                      ? const Icon(Icons.check_circle, color: Colors.green, size: 30) // Hiện tích xanh khi quét đúng
+                      : IconButton(
+                          icon: const Icon(Icons.delete, color: Colors.red), 
+                          onPressed: () async {
+                            // Khi xóa sinh viên, xóa luôn ở danh bạ chung
+                            await FirebaseDatabase.instance.ref('users/${user.uid}/fingerprints/$sid').remove();
+                            await _deviceRef.update({'mode': 'delete', 'delete_id': sid});
+                            await _classRef.child(snapshot.key!).remove();
+                          }
+                        ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _showAddStudentDialog,
+        backgroundColor: const Color(0xFF3399CC),
+        icon: const Icon(Icons.fingerprint, color: Colors.white),
+        label: const Text("Thêm sinh viên", style: TextStyle(color: Colors.white)),
+      ),
+    );
+  }
+}
+power chart screen dart 
+import 'dart:async';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:fl_chart/fl_chart.dart';
+import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+import 'power_prediction_screen.dart';
+
+class PowerChartScreen extends StatefulWidget {
+  const PowerChartScreen({super.key});
+
+  @override
+  State<PowerChartScreen> createState() => _PowerChartScreenState();
+}
+
+class _PowerChartScreenState extends State<PowerChartScreen> {
+  final user = FirebaseAuth.instance.currentUser!;
+  
+  double totalUsageKwh = 0.0;
+  List<FlSpot> hourlySpots = [];
+  
+  String selectedHistoryTab = "Weekly"; 
+
+  DateTime selectedDate = DateTime.now();
+  bool isViewingToday = true;
+
+  StreamSubscription? _streamSubscription;
+
+  // MÀU CHỦ ĐẠO – ĐỒNG BỘ VỚI TOÀN APP
+  static const Color primaryColor = Color(0xFF3399CC);
+  static const Color darkColor = Color(0xFF000066);
+
+  @override
+  void initState() {
+    super.initState();
+    _loadDataForDate(DateTime.now());
+  }
+
+  @override
+  void dispose() {
+    _streamSubscription?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _pickDate() async {
+    final DateTime? picked = await showDatePicker(
+      context: context,
+      initialDate: selectedDate,
+      firstDate: DateTime(2023),
+      lastDate: DateTime.now(),
+      builder: (context, child) {
+        return Theme(
+          data: Theme.of(context).copyWith(
+            colorScheme: const ColorScheme.light(primary: primaryColor),
+          ),
+          child: child!,
+        );
+      },
+    );
+
+    if (picked != null && picked != selectedDate) {
+      setState(() {
+        selectedDate = picked;
+        isViewingToday = DateFormat('yyyy-MM-dd').format(picked) == 
+                         DateFormat('yyyy-MM-dd').format(DateTime.now());
+      });
+      _loadDataForDate(picked);
+    }
+  }
+
+  void _loadDataForDate(DateTime date) {
+    _streamSubscription?.cancel();
+    
+    if (isViewingToday) {
+      _streamSubscription = FirebaseDatabase.instance
+          .ref('users/${user.uid}/sensors/energy_today') 
+          .onValue
+          .listen((event) {
+            final val = double.tryParse(event.snapshot.value.toString()) ?? 0.0;
+            if (mounted) setState(() => totalUsageKwh = val);
+          });
+          
+      _loadHistoryPoints(date);
+    } else {
+      String dateKey = DateFormat('yyyy-MM-dd').format(date);
+      FirebaseDatabase.instance.ref('users/${user.uid}/history/power/$dateKey').get().then((snapshot) {
+        _processHistorySnapshot(snapshot);
+      });
+    }
+  }
+
+  void _loadHistoryPoints(DateTime date) {
+    String dateKey = DateFormat('yyyy-MM-dd').format(date);
+    FirebaseDatabase.instance.ref('users/${user.uid}/history/power/$dateKey').onValue.listen((event) {
+       _processHistorySnapshot(event.snapshot);
+    });
+  }
+
+  void _processHistorySnapshot(DataSnapshot snapshot) {
+    if (!snapshot.exists || snapshot.value == null) {
+      if(mounted) setState(() => hourlySpots = []);
+      return;
+    }
+
+    final data = Map<dynamic, dynamic>.from(snapshot.value as Map);
+    List<FlSpot> tempSpots = [];
+    double total = 0;
+
+    var sortedKeys = data.keys.toList()..sort();
+    
+    for (var timeKey in sortedKeys) {
+      double val = double.tryParse(data[timeKey].toString()) ?? 0.0;
+      List<String> parts = timeKey.toString().split(':');
+      double hour = double.parse(parts[0]) + (double.parse(parts[1]) / 60.0);
+      
+      if(hour >= 0 && hour <= 24) {
+         tempSpots.add(FlSpot(hour, val));
+      }
+      total += val;
+    }
+
+    if (mounted) {
+      setState(() {
+        hourlySpots = tempSpots;
+        if (!isViewingToday) totalUsageKwh = total; 
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        elevation: 0,
+        centerTitle: true,
+        leading: const BackButton(color: darkColor),
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text("POWER", style: TextStyle(color: darkColor, fontWeight: FontWeight.bold, fontSize: 22)),
+            Icon(Icons.bolt, color: primaryColor, size: 28),
+            Text("SAVER", style: TextStyle(color: primaryColor, fontWeight: FontWeight.bold, fontSize: 22)),
+          ],
+        ),
+        actions: [
+          IconButton(
+            icon: Icon(Icons.calendar_month_outlined, color: darkColor),
+            tooltip: "Chọn ngày xem lại",
+            onPressed: _pickDate,
+          )
+        ],
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // 1. CARD TỔNG QUAN
+            _buildTodayUsageCard(),
+            
+            const SizedBox(height: 20),
+
+            // Nút Dự đoán AI
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const PowerPredictionScreen())),
+                icon: const Icon(Icons.auto_graph, size: 20),
+                label: const Text("DỰ ĐOÁN THÔNG MINH (AI)", style: TextStyle(fontWeight: FontWeight.bold)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: darkColor,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  elevation: 4,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+                ),
+              ),
+            ),
+            
+            const SizedBox(height: 30),
+            
+            // 2. BIỂU ĐỒ THEO GIỜ
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text("Hourly Consumption", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: darkColor)),
+                Text(DateFormat('dd/MM/yyyy').format(selectedDate), style: const TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
+              ],
+            ),
+            const SizedBox(height: 15),
+            _buildHourlyChart(),
+
+            const SizedBox(height: 30),
+
+            // 3. BIỂU ĐỒ LỊCH SỬ
+            Text("Usage History", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: darkColor)),
+            const SizedBox(height: 15),
+            _buildHistorySection(),
+            
+            const SizedBox(height: 50),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTodayUsageCard() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(25),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [primaryColor.withOpacity(0.15), primaryColor.withOpacity(0.05)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(25),
+        boxShadow: [
+          BoxShadow(color: primaryColor.withOpacity(0.2), blurRadius: 15, offset: const Offset(0, 10)),
+        ],
+      ),
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(15),
+            decoration: const BoxDecoration(color: Colors.white, shape: BoxShape.circle),
+            child: Icon(Icons.electric_bolt_rounded, color: primaryColor, size: 40),
+          ),
+          const SizedBox(height: 15),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.baseline,
+            textBaseline: TextBaseline.alphabetic,
+            children: [
+              Text(
+                totalUsageKwh.toStringAsFixed(2),
+                style: TextStyle(fontSize: 48, fontWeight: FontWeight.bold, color: darkColor),
+              ),
+              const SizedBox(width: 5),
+              Text("kWh", style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600, color: darkColor.withOpacity(0.7))),
+            ],
+          ),
+          Text(
+            isViewingToday ? "Today's usage" : "Usage on ${DateFormat('dd/MM').format(selectedDate)}",
+            style: TextStyle(color: darkColor.withOpacity(0.6), fontSize: 16),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHourlyChart() {
+    if (hourlySpots.isEmpty) {
+      return Container(
+        height: 200,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: Colors.grey[50],
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: Colors.grey.shade200),
+        ),
+        child: Text("Chưa có dữ liệu giờ", style: TextStyle(color: Colors.grey[600])),
+      );
+    }
+
+    return Container(
+      height: 250,
+      padding: const EdgeInsets.only(right: 20, left: 10, top: 20, bottom: 10),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: primaryColor.withOpacity(0.2)),
+        boxShadow: [BoxShadow(color: Colors.grey.shade200, blurRadius: 10, offset: const Offset(0, 5))],
+      ),
+      child: LineChart(
+        LineChartData(
+          gridData: FlGridData(show: true, drawVerticalLine: false, horizontalInterval: 1, getDrawingHorizontalLine: (value) => FlLine(color: Colors.grey.shade100, strokeWidth: 1)),
+          titlesData: FlTitlesData(
+            rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+            topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+            bottomTitles: AxisTitles(
+              sideTitles: SideTitles(
+                showTitles: true,
+                reservedSize: 30,
+                interval: 4,
+                getTitlesWidget: (value, meta) {
+                  if(value % 4 == 0) return Padding(padding: const EdgeInsets.only(top: 8), child: Text('${value.toInt()}h', style: TextStyle(color: darkColor.withOpacity(0.7), fontSize: 12)));
+                  return const SizedBox();
+                },
+              ),
+            ),
+            leftTitles: AxisTitles(
+              sideTitles: SideTitles(
+                showTitles: true,
+                interval: 1,
+                reservedSize: 40,
+                getTitlesWidget: (value, meta) => Text('${value.toInt()}k', style: TextStyle(color: darkColor.withOpacity(0.6), fontSize: 10)),
+              ),
+            ),
+          ),
+          borderData: FlBorderData(show: false),
+          minX: 0,
+          maxX: 24,
+          minY: 0,
+          lineBarsData: [
+            LineChartBarData(
+              spots: hourlySpots,
+              isCurved: true,
+              color: primaryColor,
+              barWidth: 4,
+              isStrokeCapRound: true,
+              dotData: const FlDotData(show: false),
+              belowBarData: BarAreaData(
+                show: true,
+                gradient: LinearGradient(
+                  colors: [primaryColor.withOpacity(0.3), primaryColor.withOpacity(0.0)],
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                ),
+              ),
+            ),
+          ],
+          lineTouchData: LineTouchData(
+            touchTooltipData: LineTouchTooltipData(
+              getTooltipColor: (_) => darkColor,
+              getTooltipItems: (spots) => spots.map((spot) => LineTooltipItem('${spot.y.toStringAsFixed(1)} kWh', const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))).toList(),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHistorySection() {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: primaryColor.withOpacity(0.2)),
+        boxShadow: [BoxShadow(color: Colors.grey.shade200, blurRadius: 10, offset: const Offset(0, 5))],
+      ),
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(4),
+            decoration: BoxDecoration(color: primaryColor.withOpacity(0.1), borderRadius: BorderRadius.circular(25)),
+            child: Row(
+              children: ["Weekly", "Monthly", "Yearly"].map((tab) {
+                bool isSelected = selectedHistoryTab == tab;
+                return Expanded(
+                  child: GestureDetector(
+                    onTap: () => setState(() => selectedHistoryTab = tab),
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 200),
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: isSelected ? primaryColor : Colors.transparent,
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Text(
+                        tab,
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: isSelected ? Colors.white : darkColor,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
+          const SizedBox(height: 20),
+          SizedBox(
+            height: 200,
+            child: LineChart(
+              LineChartData(
+                gridData: FlGridData(show: true, drawVerticalLine: false, getDrawingHorizontalLine: (value) => FlLine(color: Colors.grey.shade100, strokeWidth: 1)),
+                titlesData: FlTitlesData(
+                  rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                  topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                  leftTitles: AxisTitles(sideTitles: SideTitles(showTitles: true, reservedSize: 40, interval: 5, getTitlesWidget: (value, meta) => Text('${value.toInt()}k', style: TextStyle(color: darkColor.withOpacity(0.6), fontSize: 10)))),
+                  bottomTitles: AxisTitles(sideTitles: SideTitles(showTitles: true, interval: 1, getTitlesWidget: (value, meta) {
+                    List<String> labels = [];
+                    if (selectedHistoryTab == "Weekly") labels = ["S", "M", "T", "W", "T", "F", "S"];
+                    else if (selectedHistoryTab == "Monthly") labels = ["W1", "W2", "W3", "W4"];
+                    else labels = ["Q1", "Q2", "Q3", "Q4"];
+                    if (value.toInt() >= 0 && value.toInt() < labels.length) {
+                      return Padding(padding: const EdgeInsets.only(top: 8.0), child: Text(labels[value.toInt()], style: TextStyle(color: darkColor.withOpacity(0.7), fontSize: 11)));
+                    }
+                    return const SizedBox();
+                  })),
+                ),
+                borderData: FlBorderData(show: false),
+                minX: 0,
+                maxX: selectedHistoryTab == "Weekly" ? 6 : 3,
+                minY: 0,
+                lineBarsData: [
+                  LineChartBarData(
+                    spots: _getHistoryData(selectedHistoryTab),
+                    isCurved: true,
+                    color: primaryColor,
+                    barWidth: 4,
+                    isStrokeCapRound: true,
+                    dotData: const FlDotData(show: false),
+                    belowBarData: BarAreaData(
+                      show: true,
+                      gradient: LinearGradient(
+                        colors: [primaryColor.withOpacity(0.3), Colors.transparent],
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<FlSpot> _getHistoryData(String tab) {
+    if (tab == "Weekly") return const [FlSpot(0, 5), FlSpot(1, 8), FlSpot(2, 18), FlSpot(3, 12), FlSpot(4, 15), FlSpot(5, 14), FlSpot(6, 20)];
+    else if (tab == "Monthly") return const [FlSpot(0, 15), FlSpot(1, 18), FlSpot(2, 14), FlSpot(3, 20)];
+    else return const [FlSpot(0, 10), FlSpot(1, 22), FlSpot(2, 18), FlSpot(3, 24)];
+  }
+}
+power prediction screen dart 
+import 'dart:math';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:fl_chart/fl_chart.dart';
+import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+
+class PowerPredictionScreen extends StatefulWidget {
+  const PowerPredictionScreen({super.key});
+
+  @override
+  State<PowerPredictionScreen> createState() => _PowerPredictionScreenState();
+}
+
+class _PowerPredictionScreenState extends State<PowerPredictionScreen> with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+  final user = FirebaseAuth.instance.currentUser!;
+  late DatabaseReference _historyRef;
+
+  List<FlSpot> historicalSpots = [];
+  List<FlSpot> predictedSpots = [];
+  String predictionResult = "Đang tính toán...";
+  double predictedValue = 0.0;
+
+  bool isLoading = true;
+
+  // MÀU CHỦ ĐẠO – ĐỒNG BỘ VỚI TOÀN APP
+  static const Color primaryColor = Color(0xFF3399CC);
+  static const Color darkColor = Color(0xFF000066);
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 3, vsync: this);
+    _historyRef = FirebaseDatabase.instance.ref('users/${user.uid}/history/power');
+    
+    _calculatePrediction("Day");
+
+    _tabController.addListener(() {
+      if (!_tabController.indexIsChanging) {
+        switch (_tabController.index) {
+          case 0: _calculatePrediction("Day"); break;
+          case 1: _calculatePrediction("Week"); break;
+          case 2: _calculatePrediction("Month"); break;
+        }
+      }
+    });
+  }
+
+  void _runAlgorithm(List<double> yData) {
+    if (yData.length < 2) {
+      setState(() {
+        predictionResult = "Chưa đủ dữ liệu để dự đoán";
+        isLoading = false;
+        historicalSpots = [];
+        predictedSpots = [];
+      });
+      return;
+    }
+
+    int n = yData.length;
+    double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+
+    List<FlSpot> historyPoints = [];
+    for (int i = 0; i < n; i++) {
+      double x = i.toDouble();
+      double y = yData[i];
+      sumX += x;
+      sumY += y;
+      sumXY += x * y;
+      sumX2 += x * x;
+      historyPoints.add(FlSpot(x, y));
+    }
+
+    double m = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+    double c = (sumY - m * sumX) / n;
+
+    double nextX = n.toDouble();
+    double nextY = m * nextX + c;
+    if (nextY < 0) nextY = 0;
+
+    setState(() {
+      historicalSpots = historyPoints;
+      predictedSpots = [
+        FlSpot(historyPoints.last.x, historyPoints.last.y),
+        FlSpot(nextX, nextY)
+      ];
+      predictedValue = nextY;
+      predictionResult = "${nextY.toStringAsFixed(2)} kWh";
+      isLoading = false;
+    });
+  }
+
+  Future<void> _calculatePrediction(String mode) async {
+    setState(() => isLoading = true);
+    List<double> dataPoints = [];
+
+    if (mode == "Day") {
+      String yesterdayKey = DateFormat('yyyy-MM-dd').format(DateTime.now().subtract(const Duration(days: 1)));
+      final snapshot = await _historyRef.child(yesterdayKey).get();
+      
+      if (snapshot.exists) {
+        Map data = snapshot.value as Map;
+        List<double> blocks = [0, 0, 0, 0];
+        List<int> counts = [0, 0, 0, 0];
+
+        data.forEach((key, value) {
+          int hour = int.parse(key.toString().split(':')[0]);
+          double val = double.parse(value.toString());
+          
+          int blockIndex = (hour / 6).floor();
+          if(blockIndex < 4) {
+            blocks[blockIndex] += val;
+            counts[blockIndex]++;
+          }
+        });
+
+        for(int i=0; i<4; i++) {
+          if (counts[i] > 0) dataPoints.add(blocks[i]);
+          else dataPoints.add(0);
+        }
+      }
+    } 
+    else if (mode == "Week") {
+      for (int i = 6; i >= 0; i--) {
+        DateTime d = DateTime.now().subtract(Duration(days: i));
+        String key = DateFormat('yyyy-MM-dd').format(d);
+        final snap = await _historyRef.child(key).get();
+        double dailyTotal = 0;
+        if (snap.exists) {
+          Map dayData = snap.value as Map;
+          dayData.forEach((k, v) => dailyTotal += double.parse(v.toString()));
+        }
+        dataPoints.add(dailyTotal);
+      }
+    }
+    else if (mode == "Month") {
+      for (int i = 10; i >= 0; i--) {
+        DateTime d = DateTime.now().subtract(Duration(days: i));
+        String key = DateFormat('yyyy-MM-dd').format(d);
+        final snap = await _historyRef.child(key).get();
+        double dailyTotal = 0;
+        if (snap.exists) {
+          Map dayData = snap.value as Map;
+          dayData.forEach((k, v) => dailyTotal += double.parse(v.toString()));
+        }
+        dataPoints.add(dailyTotal);
+      }
+    }
+
+    _runAlgorithm(dataPoints);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        elevation: 0,
+        centerTitle: true,
+        leading: const BackButton(color: darkColor),
+        title: Text(
+          "Dự đoán Thông minh",
+          style: TextStyle(fontWeight: FontWeight.bold, color: darkColor, fontSize: 20),
+        ),
+        bottom: TabBar(
+          controller: _tabController,
+          labelColor: primaryColor,
+          unselectedLabelColor: Colors.grey,
+          indicatorColor: primaryColor,
+          indicatorWeight: 3,
+          tabs: const [
+            Tab(text: "Ngày mai"),
+            Tab(text: "Tuần tới"),
+            Tab(text: "Tháng tới"),
+          ],
+        ),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(20.0),
+        child: Column(
+          children: [
+            // Card kết quả dự đoán
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(25),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [darkColor, primaryColor],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [
+                  BoxShadow(
+                    color: primaryColor.withOpacity(0.4),
+                    blurRadius: 15,
+                    offset: const Offset(0, 8),
+                  )
+                ],
+              ),
+              child: Column(
+                children: [
+                  Text(
+                    "DỰ ĐOÁN TIÊU THỤ TIẾP THEO",
+                    style: TextStyle(color: Colors.white70, fontSize: 13, letterSpacing: 1.5, fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 12),
+                  isLoading 
+                    ? CircularProgressIndicator(color: Colors.white, strokeWidth: 3)
+                    : Text(
+                        predictionResult,
+                        style: const TextStyle(color: Colors.white, fontSize: 38, fontWeight: FontWeight.bold),
+                      ),
+                  const SizedBox(height: 12),
+                  Text(
+                    "Dựa trên thuật toán Hồi quy tuyến tính",
+                    style: TextStyle(color: Colors.white60, fontStyle: FontStyle.italic, fontSize: 11),
+                  ),
+                ],
+              ),
+            ),
+
+            const SizedBox(height: 30),
+
+            // Biểu đồ phân tích
+            Expanded(
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(10, 20, 20, 10),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: primaryColor.withOpacity(0.2)),
+                  boxShadow: [
+                    BoxShadow(color: Colors.grey.shade200, blurRadius: 10, offset: const Offset(0, 5))
+                  ],
+                ),
+                child: isLoading 
+                  ? Center(child: Text("Đang phân tích dữ liệu...", style: TextStyle(color: darkColor.withOpacity(0.7), fontSize: 16)))
+                  : LineChart(
+                      LineChartData(
+                        gridData: FlGridData(
+                          show: true,
+                          drawVerticalLine: false,
+                          getDrawingHorizontalLine: (v) => FlLine(color: Colors.grey.shade100, strokeWidth: 1),
+                        ),
+                        titlesData: FlTitlesData(
+                          rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                          topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                          leftTitles: AxisTitles(
+                            sideTitles: SideTitles(
+                              showTitles: true,
+                              reservedSize: 40,
+                              getTitlesWidget: (value, meta) => Text('${value.toInt()}k', style: TextStyle(color: darkColor.withOpacity(0.6), fontSize: 11)),
+                            ),
+                          ),
+                          bottomTitles: const AxisTitles(sideTitles: SideTitles(showTitles: true, reservedSize: 30)),
+                        ),
+                        borderData: FlBorderData(show: false),
+                        minY: 0,
+                        lineBarsData: [
+                          // Đường lịch sử: Primary color (#3399CC)
+                          LineChartBarData(
+                            spots: historicalSpots,
+                            isCurved: true,
+                            color: primaryColor,
+                            barWidth: 4,
+                            isStrokeCapRound: true,
+                            dotData: const FlDotData(show: true),
+                            belowBarData: BarAreaData(
+                              show: true,
+                              gradient: LinearGradient(
+                                colors: [primaryColor.withOpacity(0.3), primaryColor.withOpacity(0.0)],
+                                begin: Alignment.topCenter,
+                                end: Alignment.bottomCenter,
+                              ),
+                            ),
+                          ),
+                          // Đường dự đoán: Dark color (#000066) + nét đứt để phân biệt
+                          LineChartBarData(
+                            spots: predictedSpots,
+                            isCurved: true,
+                            color: darkColor,
+                            barWidth: 4,
+                            dashArray: [8, 6], // Nét đứt đẹp hơn
+                            isStrokeCapRound: true,
+                            dotData: FlDotData(
+                              show: true,
+                              getDotPainter: (spot, percent, bar, index) => FlDotCirclePainter(
+                                radius: 6,
+                                color: darkColor,
+                                strokeWidth: 3,
+                                strokeColor: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ],
+                        lineTouchData: LineTouchData(
+                          touchTooltipData: LineTouchTooltipData(
+                            getTooltipColor: (_) => darkColor,
+                            getTooltipItems: (touchedSpots) {
+                              return touchedSpots.map((spot) {
+                                final isPrediction = spot.barIndex == 1;
+                                return LineTooltipItem(
+                                  '${spot.y.toStringAsFixed(2)} kWh${isPrediction ? ' (Dự đoán)' : ''}',
+                                  TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                                );
+                              }).toList();
+                            },
+                          ),
+                        ),
+                      ),
+                    ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+profile screen dart 
+import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/services.dart';
+
+class ProfileScreen extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    // Lấy UID của người dùng hiện tại
+    final String uid = FirebaseAuth.instance.currentUser?.uid ?? "Không tìm thấy UID";
+
+    return Scaffold(
+      appBar: AppBar(title: Text("Thông tin tài khoản")),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(20.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text("Mã định danh (UID) của bạn:", style: TextStyle(fontSize: 16)),
+              SizedBox(height: 10),
+              GestureDetector(
+                onTap: () {
+                  Clipboard.setData(ClipboardData(text: uid));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text("Đã sao chép UID!")),
+                  );
+                },
+                child: Container(
+                  padding: EdgeInsets.all(15),
+                  decoration: BoxDecoration(
+                    color: Colors.blue.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: Colors.blue),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(uid, style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue)),
+                      SizedBox(width: 10),
+                      Icon(Icons.copy, color: Colors.blue),
+                    ],
+                  ),
+                ),
+              ),
+              SizedBox(height: 10),
+              Text("(Chạm vào mã trên để copy và dán vào ESP32)", style: TextStyle(fontSize: 12, color: Colors.grey)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+register screen dart 
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:flutter/material.dart';
+
+class RegisterScreen extends StatefulWidget {
+  const RegisterScreen({super.key});
+
+  @override
+  State<RegisterScreen> createState() => _RegisterScreenState();
+}
+
+class _RegisterScreenState extends State<RegisterScreen> {
+  final _usernameController = TextEditingController();
+  final _emailController = TextEditingController();
+  final _passController = TextEditingController();
+  bool isLoading = false;
+
+  static const Color primaryColor = Color(0xFF3399CC);
+  static const Color darkColor = Color(0xFF000066);
+
+  Future<void> handleRegister() async {
+    setState(() => isLoading = true);
+    try {
+      final username = _usernameController.text.trim();
+      final email = _emailController.text.trim();
+      final password = _passController.text.trim();
+
+      if (username.isEmpty || email.isEmpty || password.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Vui lòng điền đầy đủ thông tin")),
+          );
+        }
+        return;
+      }
+
+      // Tạo user với email/password
+      final userCredential = await FirebaseAuth.instance.createUserWithEmailAndPassword(
+        email: email,
+        password: password,
+      );
+
+      // Lưu username vào Realtime Database
+      final userId = userCredential.user!.uid;
+      await FirebaseDatabase.instance.ref('users/$userId').set({
+        'username': username,
+        'email': email,
+        'createdAt': DateTime.now().toIso8601String(),
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Đăng ký thành công! Vui lòng đăng nhập")),
+        );
+        Navigator.pop(context); // Quay về trang Login
+      }
+    } on FirebaseAuthException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.message ?? "Lỗi đăng ký")),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => isLoading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(
+          image: DecorationImage(
+            image: AssetImage('assets/images/background.jpg'),
+            fit: BoxFit.cover,
+            colorFilter: ColorFilter.mode(Colors.black45, BlendMode.darken),
+          ),
+        ),
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                // LOGO TRƯỜNG Ở GIỮA
+                Image.asset(
+                  'assets/images/logo.png',
+                  width: 180,
+                  height: 180,
+                  fit: BoxFit.contain,
+                ),
+                const SizedBox(height: 20),
+
+                const Text(
+                  "Đăng ký IoT Classroom",
+                  style: TextStyle(
+                    fontSize: 32,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                    shadows: [Shadow(blurRadius: 10, color: Colors.black45, offset: Offset(0, 3))],
+                  ),
+                ),
+                const SizedBox(height: 50),
+
+                // FORM ĐĂNG KÝ
+                Container(
+                  padding: const EdgeInsets.all(28),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.95),
+                    borderRadius: BorderRadius.circular(28),
+                    boxShadow: [
+                      BoxShadow(color: Colors.black.withValues(alpha: 0.3), blurRadius: 20, offset: const Offset(0, 10)),
+                    ],
+                  ),
+                  child: Column(
+                    children: [
+                      // Tên đăng nhập
+                      TextField(
+                        controller: _usernameController,
+                        decoration: InputDecoration(
+                          prefixIcon: const Icon(Icons.person, color: primaryColor),
+                          hintText: "Tên đăng nhập",
+                          filled: true,
+                          fillColor: Colors.grey[50],
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide(color: primaryColor.withValues(alpha: 0.3)),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide(color: primaryColor, width: 2),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+
+                      // Email
+                      TextField(
+                        controller: _emailController,
+                        keyboardType: TextInputType.emailAddress,
+                        decoration: InputDecoration(
+                          prefixIcon: const Icon(Icons.email, color: primaryColor),
+                          hintText: "Email",
+                          filled: true,
+                          fillColor: Colors.grey[50],
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide(color: primaryColor.withValues(alpha: 0.3)),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide(color: primaryColor, width: 2),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+
+                      // Mật khẩu
+                      TextField(
+                        controller: _passController,
+                        obscureText: true,
+                        decoration: InputDecoration(
+                          prefixIcon: const Icon(Icons.lock, color: primaryColor),
+                          hintText: "Mật khẩu",
+                          filled: true,
+                          fillColor: Colors.grey[50],
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide(color: primaryColor.withValues(alpha: 0.3)),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide(color: primaryColor, width: 2),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 30),
+
+                      isLoading
+                          ? const CircularProgressIndicator(color: primaryColor)
+                          : SizedBox(
+                              width: double.infinity,
+                              height: 54,
+                              child: ElevatedButton(
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: primaryColor,
+                                  foregroundColor: Colors.white,
+                                  elevation: 6,
+                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                ),
+                                onPressed: handleRegister,
+                                child: const Text(
+                                  "ĐĂNG KÝ",
+                                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                                ),
+                              ),
+                            ),
+
+                      const SizedBox(height: 16),
+
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: Text(
+                          "Đã có tài khoản? Đăng nhập",
+                          style: TextStyle(color: darkColor, fontWeight: FontWeight.w600, fontSize: 15),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+student history screen dart 
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:flutter/material.dart';
+import 'package:table_calendar/table_calendar.dart';
+import 'package:intl/intl.dart';
+
+class StudentHistoryScreen extends StatefulWidget {
+  final String classId;
+  final String studentId;
+  final String? studentName;
+
+  const StudentHistoryScreen({
+    super.key,
+    required this.classId,
+    required this.studentId,
+    this.studentName,
+  });
+
+  @override
+  State<StudentHistoryScreen> createState() => _StudentHistoryScreenState();
+}
+
+class _StudentHistoryScreenState extends State<StudentHistoryScreen> {
+  DateTime _focusedDay = DateTime.now();
+  DateTime? _selectedDay;
+  CalendarFormat _calendarFormat = CalendarFormat.month;
+  late DatabaseReference _attendanceRef;
+
+  Map<String, dynamic> _attendanceData = {};
+
+  static const Color primaryColor = Color(0xFF3399CC);
+  static const Color darkColor = Color(0xFF000066);
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedDay = _focusedDay;
+    final user = FirebaseAuth.instance.currentUser!;
+    _attendanceRef = FirebaseDatabase.instance.ref(
+        'users/${user.uid}/classes/${widget.classId}/students/${widget.studentId}/attendance');
+  }
+
+  Future<void> _selectDate(BuildContext context) async {
+    final DateTime? picked = await showDatePicker(
+      context: context,
+      initialDate: _focusedDay,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(2030),
+      locale: const Locale('vi', 'VN'),
+      builder: (context, child) {
+        return Theme(
+          data: Theme.of(context).copyWith(
+            colorScheme: ColorScheme.light(
+              primary: primaryColor,
+              onPrimary: Colors.white,
+              onSurface: darkColor,
+            ),
+          ),
+          child: child!,
+        );
+      },
+    );
+
+    if (picked != null && picked != _focusedDay) {
+      setState(() {
+        _focusedDay = picked;
+        _selectedDay = picked;
+      });
+    }
+  }
+
+  List<String> _getEventsForDay(DateTime day) {
+    String key = DateFormat('yyyy-MM-dd').format(day);
+    if (_attendanceData.containsKey(key)) {
+      return [_attendanceData[key]['status'] ?? 'unknown'];
+    }
+    return [];
+  }
+
+  Color _getStatusColor(String status) {
+    switch (status) {
+      case 'present':
+        return primaryColor;
+      case 'late':
+        return Colors.orange;
+      case 'absent':
+        return Colors.red;
+      default:
+        return Colors.grey;
+    }
+  }
+
+  String _getStatusText(String status) {
+    switch (status) {
+      case 'present':
+        return "Đúng giờ";
+      case 'late':
+        return "Đi trễ";
+      case 'absent':
+        return "Vắng mặt";
+      default:
+        return "Chưa cập nhật";
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: darkColor,
+        foregroundColor: Colors.white,
+        elevation: 0,
+        iconTheme: const IconThemeData(color: Colors.white),
+        title: Text(
+          widget.studentName ?? "Lịch sử Điểm danh",
+          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+        ),
+        centerTitle: true,
+      ),
+      body: StreamBuilder(
+        stream: _attendanceRef.onValue,
+        builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
+          if (snapshot.hasData && snapshot.data!.snapshot.value != null) {
+            final data = Map<String, dynamic>.from(snapshot.data!.snapshot.value as Map);
+            _attendanceData = data;
+          }
+
+          return Column(
+            children: [
+              Container(
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: const BorderRadius.only(
+                    bottomLeft: Radius.circular(20),
+                    bottomRight: Radius.circular(20),
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.05),
+                      blurRadius: 10,
+                      offset: const Offset(0, 5),
+                    ),
+                  ],
+                ),
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Column(
+                  children: [
+                    _buildTopControlBar(),
+                    _buildCalendar(),
+                  ],
+                ),
+              ),
+
+              const SizedBox(height: 10),
+
+              Expanded(
+                child: _selectedDay == null
+                    ? Center(
+                        child: Text(
+                          "Chọn ngày để xem chi tiết",
+                          style: TextStyle(color: darkColor.withValues(alpha: 0.7)),
+                        ),
+                      )
+                    : _buildDetailList(),
+              ),
+
+              _buildLegendAnnotation(),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildTopControlBar() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(10, 10, 16, 0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Row(
+            children: [
+              IconButton(
+                icon: const Icon(Icons.chevron_left, color: Colors.grey, size: 28),
+                onPressed: () {
+                  setState(() {
+                    _focusedDay = DateTime(_focusedDay.year, _focusedDay.month - 1, _focusedDay.day);
+                  });
+                },
+              ),
+              Text(
+                DateFormat('MM/yyyy').format(_focusedDay),
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: darkColor),
+              ),
+              IconButton(
+                icon: const Icon(Icons.chevron_right, color: Colors.grey, size: 28),
+                onPressed: () {
+                  setState(() {
+                    _focusedDay = DateTime(_focusedDay.year, _focusedDay.month + 1, _focusedDay.day);
+                  });
+                },
+              ),
+            ],
+          ),
+
+          Row(
+            children: [
+              InkWell(
+                onTap: () => _selectDate(context),
+                borderRadius: BorderRadius.circular(50),
+                child: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: primaryColor.withValues(alpha: 0.1),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(Icons.calendar_month, color: primaryColor, size: 22),
+                ),
+              ),
+
+              const SizedBox(width: 12),
+
+              Container(
+                height: 36,
+                padding: const EdgeInsets.all(2),
+                decoration: BoxDecoration(
+                  color: primaryColor.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  children: [
+                    _buildToggleButton("Tuần", CalendarFormat.week),
+                    _buildToggleButton("Tháng", CalendarFormat.month),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildToggleButton(String label, CalendarFormat format) {
+    bool isSelected = _calendarFormat == format;
+    return GestureDetector(
+      onTap: () {
+        setState(() {
+          _calendarFormat = format;
+        });
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: isSelected ? primaryColor : Colors.transparent,
+          borderRadius: BorderRadius.circular(6),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: isSelected ? Colors.white : darkColor,
+            fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
+            fontSize: 13,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCalendar() {
+    return TableCalendar(
+      locale: 'vi_VN',
+      firstDay: DateTime.utc(2023, 1, 1),
+      lastDay: DateTime.utc(2030, 12, 31),
+      focusedDay: _focusedDay,
+      calendarFormat: _calendarFormat,
+      startingDayOfWeek: StartingDayOfWeek.monday,
+      headerVisible: false,
+
+      selectedDayPredicate: (day) => isSameDay(_selectedDay, day),
+      onDaySelected: (selectedDay, focusedDay) {
+        setState(() {
+          _selectedDay = selectedDay;
+          _focusedDay = focusedDay;
+        });
+      },
+      onPageChanged: (focusedDay) {
+        setState(() {
+          _focusedDay = focusedDay;
+        });
+      },
+
+      eventLoader: _getEventsForDay,
+
+      calendarStyle: CalendarStyle(
+        todayDecoration: BoxDecoration(color: primaryColor.withValues(alpha: 0.3), shape: BoxShape.circle),
+        selectedDecoration: BoxDecoration(color: primaryColor, shape: BoxShape.circle),
+        weekendTextStyle: const TextStyle(color: Colors.redAccent),
+        outsideDaysVisible: false,
+      ),
+
+      calendarBuilders: CalendarBuilders(
+        markerBuilder: (context, date, events) {
+          if (events.isEmpty) return const SizedBox();
+          String status = events.first as String;
+          Color dotColor = _getStatusColor(status);
+          return Positioned(
+            bottom: 5,
+            child: Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(
+                color: dotColor,
+                shape: BoxShape.circle,
+                border: Border.all(color: Colors.white, width: 1.5),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildDetailList() {
+    String key = DateFormat('yyyy-MM-dd').format(_selectedDay!);
+
+    Widget dateLabel = Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            decoration: BoxDecoration(
+              color: primaryColor.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Text(
+              "Ngày: ${DateFormat('dd/MM/yyyy').format(_selectedDay!)}",
+              style: TextStyle(color: primaryColor, fontWeight: FontWeight.bold, fontSize: 15),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (!_attendanceData.containsKey(key)) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          dateLabel,
+          Expanded(
+            child: Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: const [
+                  Icon(Icons.event_busy, size: 60, color: Colors.grey),
+                  SizedBox(height: 16),
+                  Text("Chưa có dữ liệu điểm danh", style: TextStyle(color: Colors.grey, fontSize: 16)),
+                ],
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    final detail = Map<String, dynamic>.from(_attendanceData[key]);
+    String status = detail['status'] ?? 'unknown';
+    Color statusColor = _getStatusColor(status);
+
+    return SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          dateLabel,
+          Container(
+            margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: primaryColor.withValues(alpha: 0.2)),
+              boxShadow: [
+                BoxShadow(color: Colors.grey.withValues(alpha: 0.1), blurRadius: 15, offset: const Offset(0, 5))
+              ],
+            ),
+            child: IntrinsicHeight(
+              child: Row(
+                children: [
+                  Container(
+                    width: 6,
+                    decoration: BoxDecoration(
+                      color: statusColor,
+                      borderRadius: const BorderRadius.only(topLeft: Radius.circular(16), bottomLeft: Radius.circular(16)),
+                    ),
+                  ),
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.all(20.0),
+                      child: Column(
+                        children: [
+                          _buildDetailRow("Trạng thái", _getStatusText(status), statusColor, isBold: true),
+                          Divider(height: 30, color: Colors.grey[200]),
+                          _buildDetailRow("Giờ vào", detail['in'] ?? "--:--", darkColor),
+                          const SizedBox(height: 12),
+                          _buildDetailRow("Giờ ra", detail['out'] ?? "--:--", darkColor),
+                          const SizedBox(height: 12),
+                          _buildDetailRow("Phòng học", "Lab IoT - C204", darkColor.withValues(alpha: 0.7)),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDetailRow(String label, String value, Color color, {bool isBold = false}) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(label, style: const TextStyle(color: Colors.grey, fontSize: 14)),
+        Text(
+          value,
+          style: TextStyle(
+            color: color,
+            fontSize: 16,
+            fontWeight: isBold ? FontWeight.bold : FontWeight.w600,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLegendAnnotation() {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 15, horizontal: 20),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border(top: BorderSide(color: Colors.grey[200]!)),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceAround,
+        children: [
+          _buildLegendItem(primaryColor, "Đúng giờ"),
+          _buildLegendItem(Colors.orange, "Đi trễ"),
+          _buildLegendItem(Colors.red, "Vắng"),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLegendItem(Color color, String text) {
+    return Row(
+      children: [
+        Container(
+          width: 12,
+          height: 12,
+          decoration: BoxDecoration(
+            color: color,
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white, width: 2),
+          ),
+        ),
+        const SizedBox(width: 10),
+        Text(text, style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: darkColor)),
+      ],
+    );
+  }
+}
+weather service dart
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+
+class WeatherService {
+  // Thay thế bằng API Key thật của bạn từ OpenWeatherMap
+  final String apiKey = '29f1a9b7e19418ddc541b933e9dc50bc'; 
+
+  Future<Map<String, dynamic>> fetchWeather(String city) async {
+    try {
+      final url = 'https://api.openweathermap.org/data/2.5/weather?q=$city&appid=$apiKey&units=metric&lang=vi';
+      final response = await http.get(Uri.parse(url));
+
+      if (response.statusCode == 200) {
+        return json.decode(response.body);
+      } else {
+        // Trả về null nếu lỗi API để UI không bị đỏ
+        print("Lỗi API: ${response.statusCode}");
+        return {}; 
+      }
+    } catch (e) {
+      print("Lỗi mạng: $e");
+      return {}; // Trả về rỗng để UI xử lý êm đẹp
+    }
+  }
+}
